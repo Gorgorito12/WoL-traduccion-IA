@@ -91,16 +91,25 @@ def yield_batches(strings: Iterable[str], max_chars: int) -> Iterator[List[str]]
 
 
 def translate_batch(translator: GoogleTranslator, batch: Sequence[str]) -> List[str]:
-    payload = SEP.join(batch)
-    raw_output = translator.translate(payload)
-    parts = raw_output.split(SEP)
+    output = translator.translate_batch(batch)
 
-    if len(parts) != len(batch):
+    if not isinstance(output, list):
+        raise ValueError(
+            "El traductor no devolvió una lista de traducciones para el lote actual."
+        )
+
+    if len(output) != len(batch):
         raise ValueError(
             "El número de traducciones devuelto no coincide con el lote: "
-            f"esperado {len(batch)}, recibido {len(parts)}."
+            f"esperado {len(batch)}, recibido {len(output)}."
         )
-    return parts
+
+    safe_output: List[str] = []
+    for original, translated in zip(batch, output):
+        translated_text = "" if translated is None else str(translated)
+        safe_output.append(original if not translated_text.strip() else translated_text)
+
+    return safe_output
 
 
 def translate_batch_with_retry(
