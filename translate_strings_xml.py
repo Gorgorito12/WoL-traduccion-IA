@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import re
+import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Tuple
+from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
 
 from deep_translator import GoogleTranslator
 from tqdm import tqdm
@@ -13,13 +16,13 @@ from tqdm import tqdm
 DEFAULT_SOURCE_LANG = "en"
 DEFAULT_TARGET_LANG = "es"
 
-INNER_TEXT_RE = re.compile(r">(.*?)<", re.DOTALL)
-
 # Conserva placeholders/escapes
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
 
 SEP = "\n<<<SEG>>>\n"  # separador para dividir traducciones
 MAX_CHARS = 3500  # tamaño por request (seguro)
+DEFAULT_MAX_RETRIES = 3
+BACKOFF_SECONDS = 2.0
 
 
 def protect_tokens(text: str) -> Tuple[str, Dict[str, str]]:
@@ -87,14 +90,43 @@ def yield_batches(strings: Iterable[str], max_chars: int) -> Iterator[List[str]]
         yield batch
 
 
-def translate_batch(translator: GoogleTranslator, batch: List[str]) -> List[str]:
+def translate_batch(translator: GoogleTranslator, batch: Sequence[str]) -> List[str]:
     payload = SEP.join(batch)
     raw_output = translator.translate(payload)
     parts = raw_output.split(SEP)
 
     if len(parts) != len(batch):
-        return [translator.translate(item) for item in batch]
+        raise ValueError(
+            "El número de traducciones devuelto no coincide con el lote: "
+            f"esperado {len(batch)}, recibido {len(parts)}."
+        )
     return parts
+
+
+def translate_batch_with_retry(
+    translator: GoogleTranslator, batch: Sequence[str], max_retries: int
+) -> List[str]:
+    attempt = 0
+    while True:
+        try:
+            return translate_batch(translator, batch)
+        except Exception as exc:  # noqa: BLE001 - cualquier fallo debe reintentarse/controlarse
+            attempt += 1
+            if attempt > max_retries:
+                raise RuntimeError(
+                    "Fallaron los reintentos de traducción para el lote. "
+                    f"Primero: {batch[0][:80]!r}, tamaño: {len(batch)}"
+                ) from exc
+
+            wait = BACKOFF_SECONDS * (2 ** (attempt - 1))
+            logging.warning(
+                "Error en traducción (intento %s/%s): %s. Reintentando en %.1fs...",
+                attempt,
+                max_retries,
+                exc,
+                wait,
+            )
+            time.sleep(wait)
 
 
 def translate_strings(
@@ -102,6 +134,7 @@ def translate_strings(
     source_lang: str = DEFAULT_SOURCE_LANG,
     target_lang: str = DEFAULT_TARGET_LANG,
     max_chars: int = MAX_CHARS,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> List[str]:
     translator = build_translator(source_lang, target_lang)
 
@@ -115,24 +148,45 @@ def translate_strings(
     translated: List[str] = []
     for batch in tqdm(yield_batches(protected, max_chars), desc="Traduciendo", unit="lote"):
         empty_mask = [not item.strip() for item in batch]
-        batch_translation = translate_batch(translator, batch)
+        batch_translation = translate_batch_with_retry(translator, batch, max_retries)
+
+        if len(batch_translation) != len(batch):
+            raise RuntimeError(
+                "El número de traducciones devuelto no coincide con el lote tras reintentos."
+            )
 
         for original, translated_item, is_empty in zip(batch, batch_translation, empty_mask):
             translated.append(original if is_empty else translated_item)
 
+    if len(translated) != len(token_maps):
+        raise RuntimeError(
+            "El número total de traducciones no coincide con los textos originales "
+            f"({len(translated)} vs {len(token_maps)})."
+        )
+
     return [unprotect_tokens(text, mp) for text, mp in zip(translated, token_maps)]
 
 
-def rebuild_content(content: str, matches: List[re.Match[str]], translated: List[str]) -> str:
-    result: List[str] = []
-    last_end = 0
+def parse_strings_xml(path: Path) -> ET.ElementTree:
+    content = decode_auto(path)
+    return ET.ElementTree(ET.fromstring(content))
 
-    for match, trans in zip(matches, translated):
-        result.append(content[last_end:match.start()])
-        result.append(f">{trans}<")
-        last_end = match.end()
-    result.append(content[last_end:])
-    return "".join(result)
+
+def iter_translatable_elements(root: ET.Element) -> Iterator[ET.Element]:
+    for elem in root.findall(".//string"):
+        yield elem
+    for plural in root.findall(".//plurals"):
+        for item in plural.findall("item"):
+            yield item
+
+
+def extract_texts(elements: Iterable[ET.Element]) -> List[str]:
+    return [(elem.text or "") for elem in elements]
+
+
+def update_elements_text(elements: Iterable[ET.Element], texts: Sequence[str]) -> None:
+    for elem, text in zip(elements, texts):
+        elem.text = text
 
 
 def parse_args() -> argparse.Namespace:
@@ -142,28 +196,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source", default=DEFAULT_SOURCE_LANG, help="Idioma origen (por defecto: en)")
     parser.add_argument("--target", default=DEFAULT_TARGET_LANG, help="Idioma destino (por defecto: es)")
     parser.add_argument("--max-chars", type=int, default=MAX_CHARS, help="Máximo de caracteres por request")
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=DEFAULT_MAX_RETRIES,
+        help="Número máximo de reintentos por lote (por defecto: 3)",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
     args = parse_args()
 
     if not args.input.exists():
         raise SystemExit(f"No se encontró el archivo de entrada: {args.input}")
 
-    content = decode_auto(args.input)
-    matches = list(INNER_TEXT_RE.finditer(content))
-    inners = [match.group(1) for match in matches]
+    tree = parse_strings_xml(args.input)
+    root = tree.getroot()
+    elements = list(iter_translatable_elements(root))
+    texts = extract_texts(elements)
 
     translated = translate_strings(
-        inners,
+        texts,
         source_lang=args.source,
         target_lang=args.target,
         max_chars=args.max_chars,
+        max_retries=args.max_retries,
     )
 
-    output_content = rebuild_content(content, matches, translated)
-    args.output.write_text(output_content, encoding="utf-8", newline="\n")
+    if len(translated) != len(elements):
+        raise RuntimeError(
+            "No se pudo asignar las traducciones a los nodos del XML: "
+            f"{len(translated)} traducciones para {len(elements)} nodos."
+        )
+
+    update_elements_text(elements, translated)
+    tree.write(args.output, encoding="utf-8", xml_declaration=True)
     print(f"\n✔ Listo: {args.output}")
 
 
