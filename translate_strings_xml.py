@@ -182,11 +182,24 @@ def parse_strings_xml(path: Path) -> ET.ElementTree:
 
 
 def iter_translatable_elements(root: ET.Element) -> Iterator[ET.Element]:
-    for elem in root.findall(".//string"):
-        yield elem
-    for plural in root.findall(".//plurals"):
-        for item in plural.findall("item"):
-            yield item
+    """Itera sobre nodos <string> y <plurals>/<item>, ignorando namespaces.
+
+    Algunos archivos `strings.xml` incluyen namespaces XML; en esos casos
+    ``ElementTree.findall(".//string")`` no encuentra coincidencias porque las
+    etiquetas se representan como ``{namespace}string``. Aquí recorremos todo el
+    árbol y comparamos por sufijo para que los namespaces no impidan traducir.
+    """
+
+    def tag_matches(tag: str, name: str) -> bool:
+        return tag.split("}")[-1] == name
+
+    for elem in root.iter():
+        if tag_matches(elem.tag, "string"):
+            yield elem
+        elif tag_matches(elem.tag, "plurals"):
+            for item in elem:
+                if tag_matches(item.tag, "item"):
+                    yield item
 
 
 def extract_texts(elements: Iterable[ET.Element]) -> List[str]:
