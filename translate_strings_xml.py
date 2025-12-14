@@ -154,8 +154,10 @@ def translate_strings(
         protected.append(protected_text)
         token_maps.append(token_map)
 
+    batches = list(yield_batches(protected, max_chars))
+
     translated: List[str] = []
-    for batch in tqdm(yield_batches(protected, max_chars), desc="Traduciendo", unit="lote"):
+    for batch in tqdm(batches, desc="Traduciendo", unit="lote", total=len(batches)):
         empty_mask = [not item.strip() for item in batch]
         batch_translation = translate_batch_with_retry(translator, batch, max_retries)
 
