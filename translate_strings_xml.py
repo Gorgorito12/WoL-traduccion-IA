@@ -193,7 +193,7 @@ def iter_translatable_elements(root: ET.Element) -> Iterator[ET.Element]:
     """
 
     def tag_matches(tag: str, name: str) -> bool:
-        return tag.split("}")[-1] == name
+        return tag.split("}")[-1].lower() == name
 
     for elem in root.iter():
         if tag_matches(elem.tag, "string"):
@@ -239,6 +239,12 @@ def main() -> None:
     tree = parse_strings_xml(args.input)
     root = tree.getroot()
     elements = list(iter_translatable_elements(root))
+    count = len(elements)
+    print(f"Nodos traducibles encontrados: {count}")
+
+    if count == 0:
+        raise SystemExit("No se encontraron nodos traducibles en el XML; se aborta la traducción.")
+
     texts = extract_texts(elements)
 
     translated = translate_strings(
