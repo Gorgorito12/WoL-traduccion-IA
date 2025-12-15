@@ -8,7 +8,7 @@ import re
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from deep_translator import GoogleTranslator
 from tqdm import tqdm
@@ -144,15 +144,20 @@ def translate_strings(
     target_lang: str = DEFAULT_TARGET_LANG,
     max_chars: int = MAX_CHARS,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    progress_callback: Optional[Callable[[Sequence[str]], None]] = None,
 ) -> List[str]:
     translator = build_translator(source_lang, target_lang)
 
     protected: List[str] = []
     token_maps: List[Dict[str, str]] = []
-    for inner in inners:
+    translations: List[str] = []
+    indexes_by_protected: Dict[str, List[int]] = {}
+    for idx, inner in enumerate(inners):
         protected_text, token_map = protect_tokens(inner)
         protected.append(protected_text)
         token_maps.append(token_map)
+        translations.append(inner)
+        indexes_by_protected.setdefault(protected_text, []).append(idx)
 
     cache: Dict[str, str] = {}
     unique_to_translate: List[str] = []
@@ -178,7 +183,13 @@ def translate_strings(
         for original, translated_item in zip(batch, batch_translation):
             cache[original] = translated_item
 
-    translated = [cache[text] for text in protected]
+            for idx in indexes_by_protected.get(original, []):
+                translations[idx] = unprotect_tokens(translated_item, token_maps[idx])
+
+        if progress_callback is not None:
+            progress_callback(list(translations))
+
+    translated = translations
 
     if len(translated) != len(token_maps):
         raise RuntimeError(
@@ -186,7 +197,7 @@ def translate_strings(
             f"({len(translated)} vs {len(token_maps)})."
         )
 
-    return [unprotect_tokens(text, mp) for text, mp in zip(translated, token_maps)]
+    return translated
 
 
 def parse_strings_xml(path: Path) -> ET.ElementTree:
@@ -224,6 +235,13 @@ def update_elements_text(elements: Iterable[ET.Element], texts: Sequence[str]) -
         elem.text = text
 
 
+def write_output_snapshot(
+    tree: ET.ElementTree, elements: Sequence[ET.Element], texts: Sequence[str], output: Path
+) -> None:
+    update_elements_text(elements, texts)
+    tree.write(output, encoding="utf-8", xml_declaration=True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path, help="Archivo strings.xml de entrada")
@@ -258,12 +276,18 @@ def main() -> None:
 
     texts = extract_texts(elements)
 
+    # Crea el archivo de salida desde el inicio para que se vaya actualizando en vivo.
+    write_output_snapshot(tree, elements, texts, args.output)
+
     translated = translate_strings(
         texts,
         source_lang=args.source,
         target_lang=args.target,
         max_chars=args.max_chars,
         max_retries=args.max_retries,
+        progress_callback=lambda current: write_output_snapshot(
+            tree, elements, current, args.output
+        ),
     )
 
     if len(translated) != len(elements):
@@ -272,8 +296,7 @@ def main() -> None:
             f"{len(translated)} traducciones para {len(elements)} nodos."
         )
 
-    update_elements_text(elements, translated)
-    tree.write(args.output, encoding="utf-8", xml_declaration=True)
+    write_output_snapshot(tree, elements, translated, args.output)
     print(f"\n✔ Listo: {args.output}")
 
 
