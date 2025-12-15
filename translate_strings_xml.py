@@ -154,11 +154,20 @@ def translate_strings(
         protected.append(protected_text)
         token_maps.append(token_map)
 
-    batches = list(yield_batches(protected, max_chars))
+    cache: Dict[str, str] = {}
+    unique_to_translate: List[str] = []
+    for text in protected:
+        if not text.strip():
+            cache[text] = text
+            continue
 
-    translated: List[str] = []
+        if text not in cache:
+            cache[text] = ""
+            unique_to_translate.append(text)
+
+    batches = list(yield_batches(unique_to_translate, max_chars))
+
     for batch in tqdm(batches, desc="Traduciendo", unit="lote", total=len(batches)):
-        empty_mask = [not item.strip() for item in batch]
         batch_translation = translate_batch_with_retry(translator, batch, max_retries)
 
         if len(batch_translation) != len(batch):
@@ -166,8 +175,10 @@ def translate_strings(
                 "El número de traducciones devuelto no coincide con el lote tras reintentos."
             )
 
-        for original, translated_item, is_empty in zip(batch, batch_translation, empty_mask):
-            translated.append(original if is_empty else translated_item)
+        for original, translated_item in zip(batch, batch_translation):
+            cache[original] = translated_item
+
+    translated = [cache[text] for text in protected]
 
     if len(translated) != len(token_maps):
         raise RuntimeError(
